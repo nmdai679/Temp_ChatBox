@@ -6,10 +6,12 @@ Kiến trúc RAG: PDF -> Split -> Embed -> ChromaDB -> Retrieve -> Gemini -> Ans
 import streamlit as st
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 import tempfile
 import os
 
@@ -183,7 +185,8 @@ with st.sidebar:
     # Nút reset
     if st.button("🔄 Xoá hội thoại", use_container_width=True):
         st.session_state.chat_history = []
-        st.session_state.qa_chain = None
+        st.session_state.lc_history = []
+        st.session_state.rag_chain = None
         st.rerun()
 
     st.markdown("""
@@ -197,10 +200,13 @@ with st.sidebar:
 # KHỞI TẠO SESSION STATE
 # ─────────────────────────────────────────────
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # list of (role, content)
+    st.session_state.chat_history = []       # list of (role, content) for display
 
-if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = None
+if "lc_history" not in st.session_state:
+    st.session_state.lc_history = []          # list of LangChain message objects
+
+if "rag_chain" not in st.session_state:
+    st.session_state.rag_chain = None
 
 if "processed_file" not in st.session_state:
     st.session_state.processed_file = None
@@ -212,39 +218,34 @@ if "processed_file" not in st.session_state:
 @st.cache_resource(show_spinner=False)
 def build_rag_chain(file_bytes: bytes, filename: str, api_key: str):
     """
-    Quy trình RAG đầy đủ:
+    Quy trình RAG đầy đủ (Pure LCEL - tương thích LangChain 1.x):
     1. Document Loading  - Đọc PDF từ bytes
     2. Text Splitting    - Chia nhỏ văn bản
     3. Vector Storage    - Tạo embedding & lưu vào ChromaDB (in-memory)
-    4. Retrieval Chain   - Thiết lập chain hỏi-đáp có memory
+    4. Retrieval Chain   - Thiết lập chain hỏi-đáp với lịch sử hội thoại
     """
     os.environ["GOOGLE_API_KEY"] = api_key
 
     # ── BƯỚC 1: Document Loading ──────────────────
-    # Lưu tạm file PDF ra ổ đĩa để PyPDFLoader đọc
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     loader = PyPDFLoader(tmp_path)
-    docs = loader.load()          # List[Document], mỗi Document = 1 trang
-    os.unlink(tmp_path)           # Xoá file tạm
+    docs = loader.load()
+    os.unlink(tmp_path)   # Xoá file tạm ngay sau khi đọc xong
 
     # ── BƯỚC 2: Text Splitting ────────────────────
-    # RecursiveCharacterTextSplitter ưu tiên tách theo đoạn/câu trước,
-    # chỉ tách thô theo ký tự nếu chunk vẫn quá lớn → giữ ngữ nghĩa tốt hơn
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,       # Độ dài tối đa mỗi chunk (ký tự)
-        chunk_overlap=200,     # Overlap để không mất ngữ cảnh giữa chunks
+        chunk_size=1000,
+        chunk_overlap=200,
         separators=["\n\n", "\n", ".", " ", ""]
     )
     chunks = splitter.split_documents(docs)
 
     # ── BƯỚC 3: Vector Storage ────────────────────
-    # Tạo embedding bằng Google Generative AI Embeddings
-    # Lưu vào ChromaDB chạy in-memory (không cần server riêng)
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
+        model="models/text-embedding-004",
         google_api_key=api_key
     )
     vectorstore = Chroma.from_documents(
@@ -252,33 +253,46 @@ def build_rag_chain(file_bytes: bytes, filename: str, api_key: str):
         embedding=embeddings,
         collection_name=f"pdf_{filename[:20]}"
     )
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4}
+    )
 
-    # ── BƯỚC 4: Retrieval Chain ───────────────────
-    # ConversationalRetrievalChain = Retriever + LLM + Memory (lưu lịch sử hội thoại)
+    # ── BƯỚC 4: RAG Chain (Pure LCEL) ────────────
     llm = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash",
-        temperature=0.3,           # Thấp → trả lời chính xác, bám sát tài liệu
+        temperature=0.3,
         google_api_key=api_key
     )
 
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        output_key="answer",
-        return_messages=True
+    # Prompt trả lời câu hỏi dựa trên tài liệu
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Bạn là trợ lý AI thông minh chuyên phân tích tài liệu PDF. "
+         "Hãy trả lời câu hỏi dựa trên ngữ cảnh tài liệu được cung cấp. "
+         "Nếu không tìm thấy thông tin trong tài liệu, hãy nói thẳng là không biết. "
+         "Trả lời bằng tiếng Việt, súc tích và chính xác.\n\n"
+         "Ngữ cảnh tài liệu:\n{context}"),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    # Chain: câu hỏi → tìm tài liệu → ghép context → LLM → chuỗi trả lời
+    rag_chain = (
+        {
+            "context": RunnableLambda(lambda x: format_docs(retriever.invoke(x["input"]))),
+            "input": RunnablePassthrough() | RunnableLambda(lambda x: x["input"]),
+            "chat_history": RunnablePassthrough() | RunnableLambda(lambda x: x["chat_history"]),
+        }
+        | qa_prompt
+        | llm
+        | StrOutputParser()
     )
 
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 4}   # Lấy 4 chunk liên quan nhất
-        ),
-        memory=memory,
-        return_source_documents=True,
-        verbose=False
-    )
-
-    return qa_chain
+    return rag_chain
 
 
 # ─────────────────────────────────────────────
@@ -305,14 +319,15 @@ current_file_id = f"{uploaded_file.name}_{uploaded_file.size}"
 if st.session_state.processed_file != current_file_id:
     with st.spinner("⚙️ Đang xử lý PDF... (Loading → Splitting → Embedding)"):
         try:
-            qa_chain = build_rag_chain(
+            rag_chain = build_rag_chain(
                 file_bytes=uploaded_file.read(),
                 filename=uploaded_file.name,
                 api_key=api_key
             )
-            st.session_state.qa_chain = qa_chain
+            st.session_state.rag_chain = rag_chain
             st.session_state.processed_file = current_file_id
             st.session_state.chat_history = []
+            st.session_state.lc_history = []
             st.success(f"✅ Đã xử lý xong **{uploaded_file.name}**! Hãy đặt câu hỏi.")
         except Exception as e:
             st.error(f"❌ Lỗi khi xử lý PDF: {e}")
@@ -362,12 +377,19 @@ with st.form(key="chat_form", clear_on_submit=True):
 if submitted and user_question.strip():
     with st.spinner("🔍 AI đang phân tích..."):
         try:
-            result = st.session_state.qa_chain.invoke({"question": user_question})
-            answer = result["answer"]
+            # Chain mới trả về string trực tiếp (qua StrOutputParser)
+            answer = st.session_state.rag_chain.invoke({
+                "input": user_question,
+                "chat_history": st.session_state.lc_history
+            })
 
-            # Lưu vào lịch sử
+            # Cập nhật lịch sử hiển thị
             st.session_state.chat_history.append(("user", user_question))
             st.session_state.chat_history.append(("ai", answer))
+
+            # Cập nhật lịch sử LangChain (dạng message objects)
+            st.session_state.lc_history.append(HumanMessage(content=user_question))
+            st.session_state.lc_history.append(AIMessage(content=answer))
             st.rerun()
 
         except Exception as e:
