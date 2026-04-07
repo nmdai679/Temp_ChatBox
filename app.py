@@ -1,6 +1,6 @@
 """
 Mini AI PDF Assistant
-Kiến trúc RAG: PDF -> Split -> Embed -> ChromaDB -> Retrieve -> Gemini -> Answer
+Kiến trúc RAG: PDF -> Split -> Embed (HuggingFace local) -> ChromaDB -> Retrieve -> Gemini -> Answer
 """
 
 import streamlit as st
@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
-# CSS tuỳ chỉnh - giao diện tối hiện đại
+# CSS tuỳ chỉnh (Đã bỏ bong bóng chat custom cũ, dùng form chuẩn của Streamlit)
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -71,37 +71,6 @@ html, body, [class*="css"] {
     font-size: 1rem;
 }
 
-/* Chat bubbles */
-.chat-user {
-    background: linear-gradient(135deg, #4f46e5, #7c3aed);
-    color: white;
-    padding: 0.85rem 1.2rem;
-    border-radius: 18px 18px 4px 18px;
-    margin: 0.5rem 0 0.5rem 15%;
-    box-shadow: 0 4px 15px rgba(79,70,229,0.4);
-    font-size: 0.95rem;
-    line-height: 1.6;
-}
-.chat-ai {
-    background: rgba(255,255,255,0.07);
-    border: 1px solid rgba(255,255,255,0.12);
-    color: #e2e8f0;
-    padding: 0.85rem 1.2rem;
-    border-radius: 18px 18px 18px 4px;
-    margin: 0.5rem 15% 0.5rem 0;
-    font-size: 0.95rem;
-    line-height: 1.6;
-    backdrop-filter: blur(8px);
-}
-.chat-label {
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    margin-bottom: 0.25rem;
-    opacity: 0.65;
-}
-
 /* Upload zone */
 .upload-info {
     background: rgba(99,102,241,0.15);
@@ -112,14 +81,6 @@ html, body, [class*="css"] {
     color: #a5b4fc;
     font-size: 0.85rem;
     margin-top: 0.5rem;
-}
-
-/* Input */
-.stTextInput input, .stTextArea textarea {
-    background: rgba(255,255,255,0.07) !important;
-    border: 1px solid rgba(255,255,255,0.15) !important;
-    color: #f1f5f9 !important;
-    border-radius: 12px !important;
 }
 
 /* Buttons */
@@ -137,25 +98,25 @@ html, body, [class*="css"] {
     box-shadow: 0 6px 20px rgba(99,102,241,0.5) !important;
 }
 
-/* Divider */
 hr { border-color: rgba(255,255,255,0.1) !important; }
 
-/* Alerts */
-.stSuccess { background: rgba(52,211,153,0.15) !important; }
-.stWarning { background: rgba(251,191,36,0.15) !important; }
-.stError   { background: rgba(248,113,113,0.15) !important; }
+/* Làm cho input chat ghim ở đáy hòa hợp với nền màu đen */
+[data-testid="stChatInput"] {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 15px;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# SIDEBAR - API Key + Upload PDF
+# SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Cài đặt")
     st.divider()
 
-    # Nhập API Key
     api_key = st.text_input(
         "🔑 Google Gemini API Key",
         type="password",
@@ -165,7 +126,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Upload PDF
     st.markdown("### 📄 Tải lên tài liệu")
     uploaded_file = st.file_uploader(
         "Chọn file PDF",
@@ -183,7 +143,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Nút reset
     if st.button("🔄 Xoá hội thoại", use_container_width=True):
         st.session_state.chat_history = []
         st.session_state.lc_history = []
@@ -192,7 +151,7 @@ with st.sidebar:
 
     st.markdown("""
     <div style="color:#64748b;font-size:0.75rem;text-align:center;margin-top:1rem;">
-    Mini AI PDF Assistant v1.0<br>Powered by Gemini 1.5 Flash
+    Mini AI PDF Assistant v2.0<br>Powered by Gemini + HuggingFace
     </div>
     """, unsafe_allow_html=True)
 
@@ -201,10 +160,10 @@ with st.sidebar:
 # KHỞI TẠO SESSION STATE
 # ─────────────────────────────────────────────
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []       # list of (role, content) for display
+    st.session_state.chat_history = []
 
 if "lc_history" not in st.session_state:
-    st.session_state.lc_history = []          # list of LangChain message objects
+    st.session_state.lc_history = []
 
 if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
@@ -218,25 +177,16 @@ if "processed_file" not in st.session_state:
 # ─────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def build_rag_chain(file_bytes: bytes, filename: str, api_key: str):
-    """
-    Quy trình RAG đầy đủ (Pure LCEL - tương thích LangChain 1.x):
-    1. Document Loading  - Đọc PDF từ bytes
-    2. Text Splitting    - Chia nhỏ văn bản
-    3. Vector Storage    - Tạo embedding & lưu vào ChromaDB (in-memory)
-    4. Retrieval Chain   - Thiết lập chain hỏi-đáp với lịch sử hội thoại
-    """
     os.environ["GOOGLE_API_KEY"] = api_key
 
-    # ── BƯỚC 1: Document Loading ──────────────────
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     loader = PyPDFLoader(tmp_path)
     docs = loader.load()
-    os.unlink(tmp_path)   # Xoá file tạm ngay sau khi đọc xong
+    os.unlink(tmp_path)
 
-    # ── BƯỚC 2: Text Splitting ────────────────────
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
@@ -244,11 +194,7 @@ def build_rag_chain(file_bytes: bytes, filename: str, api_key: str):
     )
     chunks = splitter.split_documents(docs)
 
-    # ── BƯỚC 3: Vector Storage ────────────────────
-    # Dùng HuggingFace embedding chạy local - không cần API key, không bị giới hạn
-    embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2"
-    )
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
@@ -259,14 +205,12 @@ def build_rag_chain(file_bytes: bytes, filename: str, api_key: str):
         search_kwargs={"k": 4}
     )
 
-    # ── BƯỚC 4: RAG Chain (Pure LCEL) ────────────
     llm = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash",
         temperature=0.3,
         google_api_key=api_key
     )
 
-    # Prompt trả lời câu hỏi dựa trên tài liệu
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Bạn là trợ lý AI thông minh chuyên phân tích tài liệu PDF. "
@@ -281,7 +225,6 @@ def build_rag_chain(file_bytes: bytes, filename: str, api_key: str):
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
 
-    # Chain: câu hỏi → tìm tài liệu → ghép context → LLM → chuỗi trả lời
     rag_chain = (
         {
             "context": RunnableLambda(lambda x: format_docs(retriever.invoke(x["input"]))),
@@ -306,7 +249,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Kiểm tra điều kiện sẵn sàng ──
 if not api_key:
     st.info("👈 Nhập **Google Gemini API Key** vào sidebar để bắt đầu.")
     st.stop()
@@ -315,10 +257,11 @@ if not uploaded_file:
     st.info("👈 **Tải lên file PDF** trong sidebar để bắt đầu.")
     st.stop()
 
-# ── Xử lý PDF (chỉ khi file mới hoặc chain chưa build) ──
+# Xử lý PDF với st.status thay vì st.spinner ở toàn trang
 current_file_id = f"{uploaded_file.name}_{uploaded_file.size}"
 if st.session_state.processed_file != current_file_id:
-    with st.spinner("⚙️ Đang xử lý PDF... (Loading → Splitting → Embedding)"):
+    # st.status: thanh công cụ nhỏ gọn, không làm mờ UI
+    with st.status("⚙️ Đang phân tích PDF... (Loading → Splitting → Embedding)", expanded=True) as status:
         try:
             rag_chain = build_rag_chain(
                 file_bytes=uploaded_file.read(),
@@ -329,69 +272,52 @@ if st.session_state.processed_file != current_file_id:
             st.session_state.processed_file = current_file_id
             st.session_state.chat_history = []
             st.session_state.lc_history = []
-            st.success(f"✅ Đã xử lý xong **{uploaded_file.name}**! Hãy đặt câu hỏi.")
+            status.update(label=f"✅ Đã xử lý xong **{uploaded_file.name}**!", state="complete", expanded=False)
         except Exception as e:
-            st.error(f"❌ Lỗi khi xử lý PDF: {e}")
+            status.update(label=f"❌ Lỗi khi xử lý PDF: {e}", state="error")
             st.stop()
 
-# ── Hiển thị hội thoại ──
-st.markdown("### 💬 Hội thoại")
+# ────────────────────────────────────────────────────────────
+# GIAO DIỆN CHAT HIỆN ĐẠI (Tích hợp Streamlit Chat Elements)
+# ────────────────────────────────────────────────────────────
 
+# Lời chào mặc định nếu chưa có lịch sử
 if not st.session_state.chat_history:
-    st.markdown("""
-    <div class="chat-ai">
-        <div class="chat-label">🤖 AI Assistant</div>
-        Xin chào! Tôi đã đọc xong tài liệu của bạn. Hãy đặt câu hỏi về nội dung trong file PDF nhé! 🎓
-    </div>
-    """, unsafe_allow_html=True)
-else:
-    for role, content in st.session_state.chat_history:
-        if role == "user":
-            st.markdown(f"""
-            <div class="chat-user">
-                <div class="chat-label">👤 Bạn</div>
-                {content}
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class="chat-ai">
-                <div class="chat-label">🤖 AI Assistant</div>
-                {content}
-            </div>
-            """, unsafe_allow_html=True)
+    with st.chat_message("ai", avatar="🤖"):
+        st.write("Xin chào! Tôi đã đọc xong tài liệu của bạn. Hãy đặt câu hỏi về nội dung trong file nhé! 🎓")
 
-# ── Input câu hỏi ──
-st.divider()
-with st.form(key="chat_form", clear_on_submit=True):
-    cols = st.columns([5, 1])
-    with cols[0]:
-        user_question = st.text_input(
-            "Câu hỏi",
-            placeholder="Hỏi bất cứ điều gì về nội dung tài liệu...",
-            label_visibility="collapsed"
-        )
-    with cols[1]:
-        submitted = st.form_submit_button("Gửi ➤", use_container_width=True)
+# 1. Vẽ lại các tin nhắn cũ từ lịch sử
+for role, content in st.session_state.chat_history:
+    avatar = "👤" if role == "user" else "🤖"
+    with st.chat_message(role, avatar=avatar):
+        st.markdown(content)
 
-# ── Xử lý câu hỏi ──
-if submitted and user_question.strip():
-    with st.spinner("🔍 AI đang phân tích..."):
+# 2. Ô nhập liệu chuẩn Chat Input (Ghim ở đáy màn hình)
+if prompt := st.chat_input("Hỏi bất cứ điều gì về tài liệu..."):
+    
+    # 2a. Hiển thị tin nhắn của User ngay lập tức
+    with st.chat_message("user", avatar="👤"):
+        st.markdown(prompt)
+    
+    # Lưu vào lịch sử User
+    st.session_state.chat_history.append(("user", prompt))
+    st.session_state.lc_history.append(HumanMessage(content=prompt))
+
+    # 2b. Hiển thị Chat của AI và tiến hành luồng trả lời
+    with st.chat_message("ai", avatar="🤖"):
         try:
-            # Chain mới trả về string trực tiếp (qua StrOutputParser)
-            answer = st.session_state.rag_chain.invoke({
-                "input": user_question,
+            # Dùng st.write_stream để tạo hiệu ứng gõ từng chữ (Typewriter effect) cực kỳ mượt mà
+            # thay vì spinner bắt người dùng đợi toàn bộ khung chat xuất hiện.
+            stream = st.session_state.rag_chain.stream({
+                "input": prompt,
                 "chat_history": st.session_state.lc_history
             })
-
-            # Cập nhật lịch sử hiển thị
-            st.session_state.chat_history.append(("user", user_question))
+            
+            # Kết quả từng tự động in ra màn hình và trả về chuỗi hoàn chỉnh
+            answer = st.write_stream(stream)
+            
+            # Lưu lịch sử AI
             st.session_state.chat_history.append(("ai", answer))
-
-            # Cập nhật lịch sử LangChain (dạng message objects)
-            st.session_state.lc_history.append(HumanMessage(content=user_question))
             st.session_state.lc_history.append(AIMessage(content=answer))
-            st.rerun()
-
         except Exception as e:
             st.error(f"❌ Lỗi khi truy vấn AI: {e}")
