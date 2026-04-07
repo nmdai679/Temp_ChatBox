@@ -4,7 +4,8 @@ Kiến trúc RAG: PDF -> Split -> Embed -> ChromaDB -> Retrieve -> Gemini -> Ans
 """
 
 import streamlit as st
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -244,9 +245,9 @@ def build_rag_chain(file_bytes: bytes, filename: str, api_key: str):
     chunks = splitter.split_documents(docs)
 
     # ── BƯỚC 3: Vector Storage ────────────────────
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/text-embedding-004",
-        google_api_key=api_key
+    # Dùng HuggingFace embedding chạy local - không cần API key, không bị giới hạn
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2"
     )
     vectorstore = Chroma.from_documents(
         documents=chunks,
